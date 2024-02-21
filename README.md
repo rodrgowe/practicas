@@ -3,7 +3,7 @@
 ### Estos son algunos de mis codigos correspondientes para automatización
 #### Entre ellos se encuentran
 # Documento
-AUTOMATIZACIÓN DE DATOS EN PYTHON;
+AUTOMATIZACIÓN DE DATOS EN PYTHON y SQL;
 your GitHub(rodrgowe) and edX (christian_178);
 your Arequipa, Peru;
 31/12/2023.
