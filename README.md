@@ -1,7 +1,7 @@
 # Bienvenidos a mi Portafolio
 ## Aquí se encuentra mi portafolio de codigos en los que he trabajado, principalmente en python
 ### Estos son algunos de mis codigos correspondientes para automatización
-#### Entre ellos se encuentran codigos de Python principalmente, correspondientes a automatización de procesos, optimización, redes neuronales entre otros.
+#### Entre ellos se encuentran codigos de Python principalmente, correspondientes a automatización de procesos, optimización, redes neuronales entre otros. Mientras, mi proyecto de SQL, se encuentra en Youtube. Asimismo, dejo algunas prácticas de R.
 # Documento
 AUTOMATIZACIÓN DE DATOS EN PYTHON y SQL;
 your GitHub(rodrgowe) and edX (christian_178);
