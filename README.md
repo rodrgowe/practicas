@@ -5,7 +5,7 @@
 # Documento
 AUTOMATIZACIÓN DE DATOS EN PYTHON y SQL;
 your GitHub(rodrgowe) and edX (christian_178);
-your Arequipa, Peru;
+Lima, Peru;
 31/12/2023.
 By Christian Olazabal
 
