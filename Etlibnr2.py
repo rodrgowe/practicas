@@ -13,12 +13,13 @@ DECISIONES A REVISAR (marcadas con  # REVISAR  en el código):
   4. PCT_RET ya no forma parte del groupby de la base.
   5. dif < 0: se exportan como error y en el triángulo se llevan al
      desarrollo 0 (TRATO_DIF_NEGATIVO), para que la columna B sea siempre dev 0.
-  6. Atípicos por cuantía (solo NO VIDA): por archivo se suma el incurrido por
-     siniestro y se marcan (ATIPICOS='S') los que superan el P97.5 o quedan por
-     debajo del P2.5. Se marcan en la base y se EXCLUYEN del triángulo
-     (EXCLUIR_ATIPICOS_TRIANGULO = True); esto incluye también los atípicos
-     operativos del maestro (Operativo.xlsx), en vida y no vida. Ya no se usa
-     Atipicos_202608.xlsx: lo reemplaza el cálculo por percentil.
+  6. Atípicos por cuantía: por siniestro se suma el incurrido bruto en USD y se marcan
+     (ATIPICOS='S') los que superan el percentil superior o quedan por debajo del inferior.
+       - NO VIDA: por archivo, P2.5 / P97.5 (ATIPICOS_NV_POR_RAMO = True los calcula por NUEVO RAMO).
+       - VIDA: por NUEVO RAMO del maestro, P1 / P99, ANTES de separar ESSALUD-ACC.
+     Se marcan en la base y se EXCLUYEN del triángulo (EXCLUIR_ATIPICOS_TRIANGULO = True);
+     esto incluye también los atípicos operativos del maestro (Operativo.xlsx), en vida y
+     no vida. Ya no se usa Atipicos_202608.xlsx: lo reemplaza el cálculo por percentil.
   7. Póliza ESSALUD: retención fija de 20% (RET_ESSALUD).
   8. main() NO exporta: corre y revisa. Exportar es un paso aparte: exportar(res).
 
@@ -86,9 +87,12 @@ PRIORIDAD_RET = ["PCT_RET_XLSX", "PCT_RET_HIST"]  # REVISAR
 # Triángulos
 EXCLUIR_ATIPICOS_TRIANGULO = True  # excluye ATIPICOS == 'S' del triángulo
 
-# Atípicos por cuantía: percentiles del incurrido por siniestro, por archivo (solo NO VIDA)
-PERCENTIL_INF = 0.025
+# Atípicos por cuantía: percentiles del incurrido por siniestro
+PERCENTIL_INF = 0.025           # NO VIDA
 PERCENTIL_SUP = 0.975
+ATIPICOS_NV_POR_RAMO = False    # REVISAR: False = por archivo (como estaba); True = por NUEVO RAMO dentro de cada archivo
+PERCENTIL_INF_VIDA = 0.01       # VIDA: por NUEVO RAMO, antes de separar ESSALUD-ACC
+PERCENTIL_SUP_VIDA = 0.99
 COL_ATIPICO_PERCENTIL = "INCURRIDO_DOL"  # bruto en USD (comparable entre monedas)  # REVISAR
 TRATO_DIF_NEGATIVO = "a_cero"   # "a_cero" | "excluir"  # REVISAR
 DESDE_OCURRENCIA = 201901       # el triángulo empieza en este año-mes (celda A2)
@@ -283,10 +287,15 @@ def enriquecer(df: pd.DataFrame, m: Maestros) -> pd.DataFrame:
     df["PCT_RET"] = pct.fillna(1.0)
 
     # Póliza ESSALUD: retención fija, pisa cualquier otra fuente
-    es_essalud = pd.to_numeric(df["NUM_POLIZA"], errors="coerce") == POLIZA_ESSALUD
+    es_essalud = _es_essalud(df)
     df.loc[es_essalud, "PCT_RET"] = RET_ESSALUD
     df.loc[es_essalud, "RET_IMPUTADA"] = False
     return df
+
+
+def _es_essalud(df: pd.DataFrame) -> pd.Series:
+    """Máscara de la póliza ESSALUD (NUM_POLIZA puede venir como texto)."""
+    return pd.to_numeric(df["NUM_POLIZA"], errors="coerce") == POLIZA_ESSALUD
 
 
 def calcular_incurrido(df: pd.DataFrame) -> pd.DataFrame:
@@ -306,50 +315,73 @@ def calcular_incurrido(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def marcar_atipicos_percentil(df: pd.DataFrame, etiqueta: str):
-    """NO VIDA, por archivo: suma el incurrido por siniestro y marca como atípicos
-    (ATIPICOS='S') los siniestros > P_SUP o < P_INF (desigualdad estricta).
+def marcar_atipicos_percentil(
+    df: pd.DataFrame,
+    etiqueta: str,
+    q_inf: float = PERCENTIL_INF,
+    q_sup: float = PERCENTIL_SUP,
+    por_ramo: bool = False,
+):
+    """Suma el incurrido por siniestro y marca como atípicos (ATIPICOS='S') los
+    siniestros > percentil q_sup o < percentil q_inf (desigualdad estricta).
+    por_ramo=False: los percentiles se calculan sobre todo el archivo.
+    por_ramo=True : se calculan por NUEVO RAMO (con el ramo tal como está en `df`).
     Devuelve (df marcado, detalle por siniestro, estadísticas)."""
-    por_sini = df.groupby("NUM_SINI")[COL_ATIPICO_PERCENTIL].sum().dropna()
-    if por_sini.empty:
+    claves = ["NUEVO RAMO", "NUM_SINI"] if por_ramo else ["NUM_SINI"]
+    s = (
+        df.groupby(claves)[COL_ATIPICO_PERCENTIL].sum().dropna()
+        .rename("INCURRIDO").reset_index()
+    )
+    if s.empty:
         return df, pd.DataFrame(), {}
 
-    p_inf, p_sup = por_sini.quantile([PERCENTIL_INF, PERCENTIL_SUP]).tolist()
-    tipo = pd.Series(
-        np.select([por_sini > p_sup, por_sini < p_inf], ["percentil_sup", "percentil_inf"], default=""),
-        index=por_sini.index,
+    if por_ramo:
+        q = s.groupby("NUEVO RAMO")["INCURRIDO"].quantile([q_inf, q_sup]).unstack()
+        q.columns = ["P_INF", "P_SUP"]
+        s = s.merge(q, left_on="NUEVO RAMO", right_index=True, how="left")
+    else:
+        s["P_INF"], s["P_SUP"] = s["INCURRIDO"].quantile([q_inf, q_sup]).tolist()
+
+    s["TIPO_ATIPICO"] = np.select(
+        [s["INCURRIDO"] > s["P_SUP"], s["INCURRIDO"] < s["P_INF"]],
+        ["percentil_sup", "percentil_inf"],
+        default="",
     )
-    tipo = tipo[tipo != ""]
+    marc = s[s["TIPO_ATIPICO"] != ""]
 
     ya_maestro = set(df.loc[df["ATIPICOS"] == "S", "NUM_SINI"].unique())
-    detalle = pd.DataFrame({
-        "NUM_SINI": tipo.index,
-        "TIPO_ATIPICO": tipo.values,
-        "INCURRIDO": por_sini.loc[tipo.index].values,
-        "P_INF": p_inf,
-        "P_SUP": p_sup,
-        "YA_ATIPICO_MAESTRO": [n in ya_maestro for n in tipo.index],
-        "ARCHIVO": etiqueta,
-    })
+    detalle = marc[claves + ["TIPO_ATIPICO", "INCURRIDO", "P_INF", "P_SUP"]].copy()
+    detalle["YA_ATIPICO_MAESTRO"] = detalle["NUM_SINI"].isin(ya_maestro)
+    detalle["ARCHIVO"] = etiqueta
 
+    # Marca a nivel fila (todas las filas del siniestro heredan el tipo)
     df = df.copy()
     df["TIPO_ATIPICO"] = df["TIPO_ATIPICO"].astype(object)
-    nuevo_tipo = df["NUM_SINI"].map(tipo)
+    cruce = df[claves].merge(
+        marc[claves + ["TIPO_ATIPICO"]].rename(columns={"TIPO_ATIPICO": "_T"}),
+        on=claves, how="left",
+    )
+    nuevo_tipo = pd.Series(cruce["_T"].to_numpy(), index=df.index)
     nuevo = nuevo_tipo.notna() & (df["ATIPICOS"] == "N")
     df.loc[nuevo, "TIPO_ATIPICO"] = nuevo_tipo[nuevo]
     df.loc[nuevo, "ATIPICOS"] = "S"
 
-    total = por_sini.sum()
+    total = s["INCURRIDO"].sum()
     stats = {
-        "N_SINI": len(por_sini),
-        "N_ATIP_SUP": int((tipo == "percentil_sup").sum()),
-        "N_ATIP_INF": int((tipo == "percentil_inf").sum()),
-        "P_INF": p_inf,
-        "P_SUP": p_sup,
-        "PCT_MONTO_ATIP_PERCENTIL": float(por_sini.loc[tipo.index].sum() / total) if total else np.nan,
+        "N_SINI": len(s),
+        "N_ATIP_SUP": int((s["TIPO_ATIPICO"] == "percentil_sup").sum()),
+        "N_ATIP_INF": int((s["TIPO_ATIPICO"] == "percentil_inf").sum()),
+        "PCT_MONTO_ATIP_PERCENTIL": float(marc["INCURRIDO"].sum() / total) if total else np.nan,
     }
-    log.info("%s | atípicos percentil: %s sup (>%.0f), %s inf (<%.0f) de %s siniestros",
-             etiqueta, stats["N_ATIP_SUP"], p_sup, stats["N_ATIP_INF"], p_inf, stats["N_SINI"])
+    if por_ramo:
+        for ramo, g in s.groupby("NUEVO RAMO"):
+            log.info("%s | %s | atípicos percentil: %s sup (>%.0f), %s inf (<%.0f) de %s siniestros",
+                     etiqueta, ramo, int((g["TIPO_ATIPICO"] == "percentil_sup").sum()), g["P_SUP"].iloc[0],
+                     int((g["TIPO_ATIPICO"] == "percentil_inf").sum()), g["P_INF"].iloc[0], len(g))
+    else:
+        stats["P_INF"], stats["P_SUP"] = float(s["P_INF"].iloc[0]), float(s["P_SUP"].iloc[0])
+        log.info("%s | atípicos percentil: %s sup (>%.0f), %s inf (<%.0f) de %s siniestros",
+                 etiqueta, stats["N_ATIP_SUP"], stats["P_SUP"], stats["N_ATIP_INF"], stats["P_INF"], stats["N_SINI"])
     return df, detalle, stats
 
 
@@ -392,15 +424,21 @@ def procesar(df_raw: pd.DataFrame, m: Maestros, etiqueta: str, vida: bool = Fals
         log.warning("%s: bruto origen %.2f != bruto enriquecido %.2f", etiqueta, bruto_raw, bruto_enr)
 
     filas_eliminadas = 0
+    detalle_atip, stats_atip = pd.DataFrame(), {}
     if vida:
-        df["NUEVO RAMO"] = np.where(df["NUM_POLIZA"] == POLIZA_ESSALUD, "ESSALUD-ACC", df["NUEVO RAMO"])
-        mask = df["NUEVO RAMO"].eq("ELIMINAR")
+        # ELIMINAR se quita primero (salvo ESSALUD, que se conserva como ESSALUD-ACC)
+        mask = df["NUEVO RAMO"].eq("ELIMINAR") & ~_es_essalud(df)
         filas_eliminadas = int(mask.sum())
         df = df[~mask]
-
-    detalle_atip, stats_atip = pd.DataFrame(), {}
-    if not vida:
-        df, detalle_atip, stats_atip = marcar_atipicos_percentil(df, etiqueta)
+        # Atípicos de vida: por NUEVO RAMO del maestro, ANTES de separar ESSALUD-ACC
+        df, detalle_atip, stats_atip = marcar_atipicos_percentil(
+            df, etiqueta, PERCENTIL_INF_VIDA, PERCENTIL_SUP_VIDA, por_ramo=True
+        )
+        df["NUEVO RAMO"] = np.where(_es_essalud(df), "ESSALUD-ACC", df["NUEVO RAMO"])
+    else:
+        df, detalle_atip, stats_atip = marcar_atipicos_percentil(
+            df, etiqueta, PERCENTIL_INF, PERCENTIL_SUP, por_ramo=ATIPICOS_NV_POR_RAMO
+        )
 
     errores = detectar_errores(df, etiqueta)
     extra = ("FEC_SINI", "FEC_MVTO") if vida else ()
@@ -422,7 +460,7 @@ def procesar(df_raw: pd.DataFrame, m: Maestros, etiqueta: str, vida: bool = Fals
         "SIN_RAMO": int(df["NUEVO RAMO"].isna().sum()),
         "DIF_NEGATIVOS": int((df["dif"] < 0).sum()),
         "RETENCION_IMPUTADA_1": int(df["RET_IMPUTADA"].sum()),
-        "FILAS_ESSALUD_RET_20": int((pd.to_numeric(df["NUM_POLIZA"], errors="coerce") == POLIZA_ESSALUD).sum()),
+        "FILAS_ESSALUD_RET_20": int(_es_essalud(df).sum()),
         **stats_atip,
     }
     log.info("%s | TC nulos=%s | sin ramo=%s | dif<0=%s | ret imputada=%s",
