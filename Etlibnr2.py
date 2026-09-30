@@ -22,6 +22,11 @@ DECISIONES A REVISAR (marcadas con  # REVISAR  en el código):
      no vida. Ya no se usa Atipicos_202608.xlsx: lo reemplaza el cálculo por percentil.
   7. Póliza ESSALUD: retención fija de 20% (RET_ESSALUD).
   8. main() NO exporta: corre y revisa. Exportar es un paso aparte: exportar(res).
+  9. Triángulos en bruto (INCURRIDO_MON) y en neto (INCURRIDO_MON_NETO): 4 Excel
+     (no vida bruto / no vida neto / vida bruto / vida neto), una hoja por ramo.
+     La revisión (alertas y diagnóstico) se hace sobre el neto.
+ 10. La revisión incluye la tabla de ratio de retención (neto/bruto) por NUEVO RAMO,
+     con y sin atípicos (desde DESDE_OCURRENCIA).
 
 Uso (por celdas):
     res, rev = main()      # correr + revisión actuarial
@@ -99,7 +104,9 @@ DESDE_OCURRENCIA = 201901       # el triángulo empieza en este año-mes (celda 
 MES_CORTE = 202608              # REVISAR: último mes de cierre (para los controles)
 
 # Triángulos en Excel
-# (un Excel para no vida y otro para vida, una hoja por ramo; índices desde A2, valores desde B2)
+# (4 archivos: no vida / vida x bruto / neto; una hoja por ramo; índices desde A2, valores desde B2)
+COL_TRIANGULO_BRUTO = "INCURRIDO_MON"        # bruto, en la moneda del ramo
+COL_TRIANGULO_NETO = "INCURRIDO_MON_NETO"    # neto de reaseguro, en la moneda del ramo
 TRIANGULO_ACUMULADO = False     # False = incremental (como el original)  # REVISAR
 TRIANGULO_FUTURO_VACIO = False  # True = deja en blanco las celdas no observadas
 
@@ -611,6 +618,36 @@ def resumen_anual(base: pd.DataFrame) -> pd.DataFrame:
     return g.drop(columns=["INCURRIDO_DOL", "INCURRIDO_DOL_NETO", "DOL_ATIPICO"])
 
 
+def ratio_retencion(base: pd.DataFrame, por_anio: bool = False) -> pd.DataFrame:
+    """Ratio de retención (neto / bruto, en USD) por NUEVO RAMO, con y sin atípicos.
+    Usa la misma ventana que los triángulos (AÑO_MES_OCU >= DESDE_OCURRENCIA).
+    DIF_PUNTOS = ratio sin atípicos - ratio con atípicos (en puntos de ratio).
+    Con por_anio=True desagrega además por AÑO_SINI."""
+    b = base
+    if DESDE_OCURRENCIA is not None:
+        b = b[b["AÑO_MES_OCU"] >= DESDE_OCURRENCIA]
+    claves = ["NUEVO RAMO"] + (["AÑO_SINI"] if por_anio else [])
+
+    def sumar(d: pd.DataFrame, suf: str) -> pd.DataFrame:
+        g = d.groupby(claves, dropna=False)[["INCURRIDO_DOL", "INCURRIDO_DOL_NETO"]].sum() / 1000
+        g.columns = [f"BRUTO_{suf}_MILES", f"NETO_{suf}_MILES"]
+        return g
+
+    r = sumar(b, "CON_ATIP").join(sumar(b[b["ATIPICOS"] == "N"], "SIN_ATIP"), how="left").reset_index()
+    if not por_anio:
+        tot = r.drop(columns=["NUEVO RAMO"]).sum(numeric_only=True).to_frame().T
+        tot.insert(0, "NUEVO RAMO", "TOTAL")
+        r = pd.concat([r, tot], ignore_index=True)
+
+    for suf in ("CON_ATIP", "SIN_ATIP"):
+        bruto = r[f"BRUTO_{suf}_MILES"].where(r[f"BRUTO_{suf}_MILES"] != 0)
+        r[f"RATIO_RET_{suf}"] = r[f"NETO_{suf}_MILES"] / bruto
+    r["DIF_PUNTOS"] = r["RATIO_RET_SIN_ATIP"] - r["RATIO_RET_CON_ATIP"]
+
+    orden = claves + ["RATIO_RET_CON_ATIP", "RATIO_RET_SIN_ATIP", "DIF_PUNTOS"]
+    return r[orden + [c for c in r.columns if c not in orden]]
+
+
 def tc_implicito(base: pd.DataFrame) -> pd.DataFrame:
     """SOL/DOL por mes de movimiento = TC efectivamente aplicado. Debe ser una serie suave."""
     g = base.groupby("AÑO_MES_MOV")[["INCURRIDO_SOL", "INCURRIDO_DOL"]].sum()
@@ -678,7 +715,9 @@ def diagnosticar_triangulo(ramo: str, t: pd.DataFrame):
 
 
 def revisar(res: dict) -> dict:
-    """Controles de sentido actuarial. No exporta nada. Devuelve tablas + 'alertas'."""
+    """Controles de sentido actuarial. No exporta nada. Devuelve tablas + 'alertas'.
+    Las alertas y el diagnóstico de triángulos se calculan sobre el NETO; el diagnóstico
+    del bruto queda en rev['diagnostico_triangulos_<nv|v>_bruto'] (sin alertas)."""
     alertas: list[str] = []
     rev: dict = {}
     u = UMBRALES
@@ -703,7 +742,8 @@ def revisar(res: dict) -> dict:
     total_sol = 0.0
     for k, nombre in segmentos.items():
         base = res[f"base_{k}"]
-        tris = res[f"tri_{k}"]
+        tris = res[f"tri_{k}_neto"]
+        tris_bruto = res[f"tri_{k}_bruto"]
         if base.empty:
             continue
         total_sol += base["INCURRIDO_SOL"].sum()
@@ -723,6 +763,9 @@ def revisar(res: dict) -> dict:
             salto = g["RET_IMPLICITA"].diff().abs()
             for _, r in g[salto > u["salto_retencion"]].iterrows():
                 alertas.append(f"[{nombre}] {ramo} {r['AÑO_SINI']}: retención implícita cambia >{u['salto_retencion']:.0%} vs año previo")
+
+        # --- ratio de retención por ramo, con y sin atípicos ---
+        rev[f"ratio_retencion_{k}"] = ratio_retencion(base)
 
         # --- tipo de cambio efectivamente aplicado ---
         tc = tc_implicito(base)
@@ -746,7 +789,7 @@ def revisar(res: dict) -> dict:
         if base["AÑO_MES_OCU"].max() > MES_CORTE:
             alertas.append(f"[{nombre}] hay siniestros ocurridos posteriores al corte {MES_CORTE}: máx {base['AÑO_MES_OCU'].max()}")
 
-        # --- triángulos ---
+        # --- triángulos (neto: con alertas) ---
         filas, factores = [], {}
         for ramo, t in tris.items():
             fila, f = diagnosticar_triangulo(ramo, t)
@@ -767,6 +810,12 @@ def revisar(res: dict) -> dict:
         if filas:
             rev[f"diagnostico_triangulos_{k}"] = pd.DataFrame(filas)
             rev[f"factores_{k}"] = pd.DataFrame(factores).T
+
+        # --- triángulos (bruto: solo diagnóstico) ---
+        if tris_bruto:
+            rev[f"diagnostico_triangulos_{k}_bruto"] = pd.DataFrame(
+                [diagnosticar_triangulo(ramo, t)[0] for ramo, t in tris_bruto.items()]
+            )
 
     # --- errores de datos ---
     err = res["errores"]
@@ -791,8 +840,13 @@ def revisar(res: dict) -> dict:
     for k in ("nv", "v"):
         d = rev.get(f"diagnostico_triangulos_{k}")
         if d is not None:
-            print(f"\n--- Diagnóstico triángulos {segmentos[k]} ---")
+            print(f"\n--- Diagnóstico triángulos {segmentos[k]} (neto) ---")
             print(d.round(3).to_string(index=False))
+    for k in ("nv", "v"):
+        d = rev.get(f"ratio_retencion_{k}")
+        if d is not None:
+            print(f"\n--- Ratio de retención (neto/bruto, USD) {segmentos[k]} ---")
+            print(d[["NUEVO RAMO", "RATIO_RET_CON_ATIP", "RATIO_RET_SIN_ATIP", "DIF_PUNTOS"]].round(4).to_string(index=False))
     print("\nTablas en rev:", ", ".join(rev.keys()))
     return rev
 
@@ -837,14 +891,20 @@ def correr() -> dict:
 
     base_nv = pd.concat(bases_nv, ignore_index=True) if bases_nv else pd.DataFrame()
     base_v = pd.concat(bases_v, ignore_index=True) if bases_v else pd.DataFrame()
+
+    def triangulos(base: pd.DataFrame, col: str) -> dict[str, pd.DataFrame]:
+        return construir_triangulos(base, col) if not base.empty else {}
+
     return {
         "base_nv": base_nv,
         "base_v": base_v,
         "errores": pd.concat(errores, ignore_index=True) if errores else pd.DataFrame(),
         "cuadres": pd.DataFrame(cuadres),
         "atipicos_percentil": pd.concat(atipicos, ignore_index=True) if atipicos else pd.DataFrame(),
-        "tri_nv": construir_triangulos(base_nv) if not base_nv.empty else {},
-        "tri_v": construir_triangulos(base_v) if not base_v.empty else {},
+        "tri_nv_bruto": triangulos(base_nv, COL_TRIANGULO_BRUTO),
+        "tri_nv_neto": triangulos(base_nv, COL_TRIANGULO_NETO),
+        "tri_v_bruto": triangulos(base_v, COL_TRIANGULO_BRUTO),
+        "tri_v_neto": triangulos(base_v, COL_TRIANGULO_NETO),
     }
 
 
@@ -852,8 +912,9 @@ def exportar(res: dict, bases: bool = True, errores: bool = True, cuadres: bool 
              atipicos: bool = True, triangulos: bool = True) -> None:
     """Exporta lo ya revisado.
     Bases, errores, cuadres y atípicos -> RUTA_OUTPUT.
-    Triángulos -> RUTA_TRIANGULOS: triangulos_no_vida_<SUFIJO>.xlsx y triangulos_vida_<SUFIJO>.xlsx,
-    con una hoja por ramo."""
+    Triángulos -> RUTA_TRIANGULOS, 4 archivos con una hoja por ramo:
+      triangulos_no_vida_bruto_<SUFIJO>.xlsx, triangulos_no_vida_neto_<SUFIJO>.xlsx,
+      triangulos_vida_bruto_<SUFIJO>.xlsx,    triangulos_vida_neto_<SUFIJO>.xlsx"""
     RUTA_OUTPUT.mkdir(parents=True, exist_ok=True)
     if cuadres:
         exportar_tabla(res["cuadres"], f"cuadres_{SUFIJO}")
@@ -869,10 +930,12 @@ def exportar(res: dict, bases: bool = True, errores: bool = True, cuadres: bool 
             if not e.empty:
                 exportar_tabla(e, f"errores{suf}_final_{SUFIJO}")
     if triangulos:
-        for clave, nombre in [("tri_nv", f"triangulos_no_vida_{SUFIJO}"), ("tri_v", f"triangulos_vida_{SUFIJO}")]:
-            ruta = exportar_triangulos_excel(res[clave], nombre)
-            if ruta:
-                print(f"Triángulos: {ruta} ({len(res[clave])} hojas)")
+        for seg, nom_seg in [("nv", "no_vida"), ("v", "vida")]:
+            for tipo in ("bruto", "neto"):
+                tri = res[f"tri_{seg}_{tipo}"]
+                ruta = exportar_triangulos_excel(tri, f"triangulos_{nom_seg}_{tipo}_{SUFIJO}")
+                if ruta:
+                    print(f"Triángulos {nom_seg} {tipo}: {ruta} ({len(tri)} hojas)")
 
 
 def extras() -> None:
