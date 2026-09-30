@@ -91,7 +91,7 @@ EXCLUIR_ATIPICOS_TRIANGULO = True  # excluye ATIPICOS == 'S' del triángulo
 PERCENTIL_INF = 0.025
 PERCENTIL_SUP = 0.975
 COL_ATIPICO_PERCENTIL = "INCURRIDO_DOL"  # bruto en USD (comparable entre monedas)  # REVISAR
-TRATO_DIF_NEGATIVO = "a_cero"   # "a_cero" | "excluir" | "mantener"  # REVISAR
+TRATO_DIF_NEGATIVO = "a_cero"   # "a_cero" | "excluir"  # REVISAR
 DESDE_OCURRENCIA = 201901       # el triángulo empieza en este año-mes (celda A2)
 MES_CORTE = 202608              # REVISAR: último mes de cierre (para los controles)
 
@@ -437,7 +437,9 @@ def procesar(df_raw: pd.DataFrame, m: Maestros, etiqueta: str, vida: bool = Fals
 # 6. TRIÁNGULOS
 # =============================================================================
 def construir_triangulos(base: pd.DataFrame, col: str = "INCURRIDO_MON_NETO") -> dict[str, pd.DataFrame]:
-    """Un triángulo (incremental) por NUEVO RAMO, con meses y desarrollos completos."""
+    """Un triángulo (incremental) por NUEVO RAMO, siempre cuadrado (a x a):
+    filas = meses de ocurrencia desde DESDE_OCURRENCIA hasta MES_CORTE,
+    columnas = desarrollos 0 .. a-1."""
     b = base.dropna(subset=["NUEVO RAMO", "AÑO_MES_OCU", "dif"])
     if len(b) < len(base):
         log.warning("Triángulos: %s filas de la base sin ramo/fecha quedan fuera", len(base) - len(b))
@@ -447,7 +449,7 @@ def construir_triangulos(base: pd.DataFrame, col: str = "INCURRIDO_MON_NETO") ->
         b = b[b["AÑO_MES_OCU"] >= DESDE_OCURRENCIA]
     if TRATO_DIF_NEGATIVO == "excluir":
         b = b[b["dif"] >= 0]
-    elif TRATO_DIF_NEGATIVO == "a_cero":
+    else:  # "a_cero"
         b = b.assign(dif=b["dif"].clip(lower=0))
 
     triangulos: dict[str, pd.DataFrame] = {}
@@ -459,16 +461,17 @@ def construir_triangulos(base: pd.DataFrame, col: str = "INCURRIDO_MON_NETO") ->
 
         inicio = DESDE_OCURRENCIA if DESDE_OCURRENCIA is not None else t.index.min()
         f_min = pd.to_datetime(str(inicio), format="%Y%m")
-        f_max = pd.to_datetime(str(t.index.max()), format="%Y%m")
+        fin = max(MES_CORTE, int(t.index.max())) if MES_CORTE is not None else int(t.index.max())
+        f_max = pd.to_datetime(str(fin), format="%Y%m")
         meses = pd.date_range(f_min, f_max, freq="MS").strftime("%Y%m").astype(int).tolist()
-        devs = list(range(int(t.columns.min()), int(t.columns.max()) + 1))
+        devs = list(range(len(meses)))  # cuadrado: nº de desarrollos = nº de meses
 
         t = t.reindex(index=meses, columns=devs).fillna(0)
         t.index.name = "AÑO_MES_OCU"
         t.columns.name = "dif"
 
         if not np.isclose(t.values.sum(), g[col].sum()):
-            log.warning("Triángulo %s no cuadra con la base", ramo)
+            log.warning("Triángulo %s no cuadra con la base (movimientos fuera del cuadrado: posteriores al corte?)", ramo)
         triangulos[ramo] = t
     return triangulos
 
@@ -661,6 +664,7 @@ def diagnosticar_triangulo(ramo: str, t: pd.DataFrame):
         "RAMO": ramo,
         "MES_INI": int(t.index.min()),
         "MES_FIN": int(t.index.max()),
+        "ULTIMO_MES_CON_DATOS": int(t.index[(t != 0).any(axis=1)].max()) if (t != 0).any().any() else None,
         "N_DESARROLLOS": t.shape[1],
         "INCURRIDO_ACUM_ACTUAL_MILES": diag.sum() / 1000,
         "ULT3_MESES_MILES": diag.tail(3).sum() / 1000,
@@ -748,8 +752,8 @@ def revisar(res: dict) -> dict:
             fila, f = diagnosticar_triangulo(ramo, t)
             filas.append(fila)
             factores[ramo] = f
-            if fila["MES_FIN"] != MES_CORTE:
-                alertas.append(f"[{nombre}] {ramo}: el triángulo termina en {fila['MES_FIN']}, el corte es {MES_CORTE}")
+            if fila["ULTIMO_MES_CON_DATOS"] is None or fila["ULTIMO_MES_CON_DATOS"] < MES_CORTE:
+                alertas.append(f"[{nombre}] {ramo}: último mes de ocurrencia con datos = {fila['ULTIMO_MES_CON_DATOS']}, el corte es {MES_CORTE}")
             if fila["MESES_RECIENTES_CERO(6)"] >= 3:
                 alertas.append(f"[{nombre}] {ramo}: {fila['MESES_RECIENTES_CERO(6)']} de los últimos 6 meses sin incurrido")
             if fila["PCT_CELDAS_NEG"] > u["pct_celdas_neg"]:
