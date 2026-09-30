@@ -13,7 +13,14 @@ DECISIONES A REVISAR (marcadas con  # REVISAR  en el código):
   4. PCT_RET ya no forma parte del groupby de la base.
   5. dif < 0: se exportan como error y en el triángulo se llevan al
      desarrollo 0 (TRATO_DIF_NEGATIVO), para que la columna B sea siempre dev 0.
-  6. main() NO exporta: corre y revisa. Exportar es un paso aparte: exportar(res).
+  6. Atípicos por cuantía (solo NO VIDA): por archivo se suma el incurrido por
+     siniestro y se marcan (ATIPICOS='S') los que superan el P97.5 o quedan por
+     debajo del P2.5. Se marcan en la base y se EXCLUYEN del triángulo
+     (EXCLUIR_ATIPICOS_TRIANGULO = True); esto incluye también los atípicos
+     operativos del maestro (Operativo.xlsx), en vida y no vida. Ya no se usa
+     Atipicos_202608.xlsx: lo reemplaza el cálculo por percentil.
+  7. Póliza ESSALUD: retención fija de 20% (RET_ESSALUD).
+  8. main() NO exporta: corre y revisa. Exportar es un paso aparte: exportar(res).
 
 Uso (por celdas):
     res, rev = main()      # correr + revisión actuarial
@@ -70,6 +77,7 @@ TIP_EXP_TRANSFERIBLES = ["RDR", "RCT", "RAC", "RAA"]
 
 # Vida
 POLIZA_ESSALUD = 6362159900003
+RET_ESSALUD = 0.20  # retención fija de la póliza ESSALUD
 
 # Retención
 CLAVE_RET_HIST = ["COD_CIA", "COD_RAMO", "NUM_SINI", "NUM_EXP"]
@@ -77,7 +85,12 @@ CLAVE_RET_XLSX = ["NUM_SINI", "NUM_EXP", "COD_COB"]
 PRIORIDAD_RET = ["PCT_RET_XLSX", "PCT_RET_HIST"]  # REVISAR
 
 # Triángulos
-EXCLUIR_ATIPICOS_TRIANGULO = False
+EXCLUIR_ATIPICOS_TRIANGULO = True  # excluye ATIPICOS == 'S' del triángulo
+
+# Atípicos por cuantía: percentiles del incurrido por siniestro, por archivo (solo NO VIDA)
+PERCENTIL_INF = 0.025
+PERCENTIL_SUP = 0.975
+COL_ATIPICO_PERCENTIL = "INCURRIDO_DOL"  # bruto en USD (comparable entre monedas)  # REVISAR
 TRATO_DIF_NEGATIVO = "a_cero"   # "a_cero" | "excluir" | "mantener"  # REVISAR
 DESDE_OCURRENCIA = 201901       # el triángulo empieza en este año-mes (celda A2)
 MES_CORTE = 202608              # REVISAR: último mes de cierre (para los controles)
@@ -142,18 +155,12 @@ def cargar_maestros() -> Maestros:
     ramos = pd.read_excel(RUTA_MAESTROS / "maestros.xlsx")
     ramos = ramos[["COD_RAMO", "SUBGRUPO", "NUEVO RAMO", "MONEDA"]]
 
-    # Atípicos (cuantía tiene prioridad sobre operativo)
-    atip = (
-        pd.read_excel(RUTA_MAESTROS / "Atipicos_202608.xlsx")[["NUM_SINI"]]
-        .drop_duplicates()
-        .assign(ATIPICOS="S", TIPO_ATIPICO="cuantia")
-    )
-    oper = (
+    # Atípicos operativos (los de cuantía ahora se calculan por percentil en marcar_atipicos_percentil)
+    atipicos = (
         pd.read_excel(RUTA_MAESTROS / "Operativo.xlsx")[["NUM_SINI"]]
         .drop_duplicates()
         .assign(ATIPICOS="S", TIPO_ATIPICO="operativa")
     )
-    atipicos = pd.concat([atip, oper], ignore_index=True).drop_duplicates("NUM_SINI", keep="first")
 
     # Retención histórica (No vida + Vida)
     ret_hist = pd.concat(
@@ -268,13 +275,19 @@ def enriquecer(df: pd.DataFrame, m: Maestros) -> pd.DataFrame:
     if len(df) != n0:
         raise RuntimeError(f"Los merges cambiaron el número de filas: {n0} -> {len(df)}")
 
-    df["ATIPICOS"] = df["ATIPICOS"].fillna("N")
+    df["ATIPICOS"] = df["ATIPICOS"].astype(object).fillna("N")
+    df["TIPO_ATIPICO"] = df["TIPO_ATIPICO"].astype(object)
 
     pct = pd.Series(np.nan, index=df.index)
     for col in PRIORIDAD_RET:
         pct = pct.fillna(df[col])
     df["RET_IMPUTADA"] = pct.isna()
     df["PCT_RET"] = pct.fillna(1.0)
+
+    # Póliza ESSALUD: retención fija, pisa cualquier otra fuente
+    es_essalud = pd.to_numeric(df["NUM_POLIZA"], errors="coerce") == POLIZA_ESSALUD
+    df.loc[es_essalud, "PCT_RET"] = RET_ESSALUD
+    df.loc[es_essalud, "RET_IMPUTADA"] = False
     return df
 
 
@@ -293,6 +306,53 @@ def calcular_incurrido(df: pd.DataFrame) -> pd.DataFrame:
     df["INCURRIDO_MON"] = np.where(es_pen, df["INCURRIDO_SOL"], df["INCURRIDO_DOL"])
     df["INCURRIDO_MON_NETO"] = np.where(es_pen, df["INCURRIDO_SOL_NETO"], df["INCURRIDO_DOL_NETO"])
     return df
+
+
+def marcar_atipicos_percentil(df: pd.DataFrame, etiqueta: str):
+    """NO VIDA, por archivo: suma el incurrido por siniestro y marca como atípicos
+    (ATIPICOS='S') los siniestros > P_SUP o < P_INF (desigualdad estricta).
+    Devuelve (df marcado, detalle por siniestro, estadísticas)."""
+    por_sini = df.groupby("NUM_SINI")[COL_ATIPICO_PERCENTIL].sum().dropna()
+    if por_sini.empty:
+        return df, pd.DataFrame(), {}
+
+    p_inf, p_sup = por_sini.quantile([PERCENTIL_INF, PERCENTIL_SUP]).tolist()
+    tipo = pd.Series(
+        np.select([por_sini > p_sup, por_sini < p_inf], ["percentil_sup", "percentil_inf"], default=""),
+        index=por_sini.index,
+    )
+    tipo = tipo[tipo != ""]
+
+    ya_maestro = set(df.loc[df["ATIPICOS"] == "S", "NUM_SINI"].unique())
+    detalle = pd.DataFrame({
+        "NUM_SINI": tipo.index,
+        "TIPO_ATIPICO": tipo.values,
+        "INCURRIDO": por_sini.loc[tipo.index].values,
+        "P_INF": p_inf,
+        "P_SUP": p_sup,
+        "YA_ATIPICO_MAESTRO": [n in ya_maestro for n in tipo.index],
+        "ARCHIVO": etiqueta,
+    })
+
+    df = df.copy()
+    df["TIPO_ATIPICO"] = df["TIPO_ATIPICO"].astype(object)
+    nuevo_tipo = df["NUM_SINI"].map(tipo)
+    nuevo = nuevo_tipo.notna() & (df["ATIPICOS"] == "N")
+    df.loc[nuevo, "TIPO_ATIPICO"] = nuevo_tipo[nuevo]
+    df.loc[nuevo, "ATIPICOS"] = "S"
+
+    total = por_sini.sum()
+    stats = {
+        "N_SINI": len(por_sini),
+        "N_ATIP_SUP": int((tipo == "percentil_sup").sum()),
+        "N_ATIP_INF": int((tipo == "percentil_inf").sum()),
+        "P_INF": p_inf,
+        "P_SUP": p_sup,
+        "PCT_MONTO_ATIP_PERCENTIL": float(por_sini.loc[tipo.index].sum() / total) if total else np.nan,
+    }
+    log.info("%s | atípicos percentil: %s sup (>%.0f), %s inf (<%.0f) de %s siniestros",
+             etiqueta, stats["N_ATIP_SUP"], p_sup, stats["N_ATIP_INF"], p_inf, stats["N_SINI"])
+    return df, detalle, stats
 
 
 # =============================================================================
@@ -321,7 +381,7 @@ def agrupar_base(df: pd.DataFrame, extra: tuple[str, ...] = ()) -> pd.DataFrame:
 
 
 def procesar(df_raw: pd.DataFrame, m: Maestros, etiqueta: str, vida: bool = False):
-    """Devuelve (base, errores, cuadre)."""
+    """Devuelve (base, errores, cuadre, detalle de atípicos por percentil)."""
     log.info("Procesando %s (%s filas)", etiqueta, len(df_raw))
     n_raw = len(df_raw)
     bruto_raw = (df_raw["RESERVA_BRUTO"] + df_raw["PAGO_BRUTO"]).sum()
@@ -339,6 +399,10 @@ def procesar(df_raw: pd.DataFrame, m: Maestros, etiqueta: str, vida: bool = Fals
         mask = df["NUEVO RAMO"].eq("ELIMINAR")
         filas_eliminadas = int(mask.sum())
         df = df[~mask]
+
+    detalle_atip, stats_atip = pd.DataFrame(), {}
+    if not vida:
+        df, detalle_atip, stats_atip = marcar_atipicos_percentil(df, etiqueta)
 
     errores = detectar_errores(df, etiqueta)
     extra = ("FEC_SINI", "FEC_MVTO") if vida else ()
@@ -360,11 +424,13 @@ def procesar(df_raw: pd.DataFrame, m: Maestros, etiqueta: str, vida: bool = Fals
         "SIN_RAMO": int(df["NUEVO RAMO"].isna().sum()),
         "DIF_NEGATIVOS": int((df["dif"] < 0).sum()),
         "RETENCION_IMPUTADA_1": int(df["RET_IMPUTADA"].sum()),
+        "FILAS_ESSALUD_RET_20": int((pd.to_numeric(df["NUM_POLIZA"], errors="coerce") == POLIZA_ESSALUD).sum()),
+        **stats_atip,
     }
     log.info("%s | TC nulos=%s | sin ramo=%s | dif<0=%s | ret imputada=%s",
              etiqueta, cuadre["TC_NULOS"], cuadre["SIN_RAMO"],
              cuadre["DIF_NEGATIVOS"], cuadre["RETENCION_IMPUTADA_1"])
-    return base, errores, cuadre
+    return base, errores, cuadre, detalle_atip
 
 
 # =============================================================================
@@ -627,6 +693,9 @@ def revisar(res: dict) -> dict:
             alertas.append(f"[INFO] {r['ARCHIVO']}: {r['FILAS_ELIMINADAS']} filas eliminadas (ramo ELIMINAR)")
         rev["cuadres"] = c
 
+    if not res["atipicos_percentil"].empty:
+        rev["atipicos_percentil"] = res["atipicos_percentil"]
+
     total_sol = 0.0
     for k, nombre in segmentos.items():
         base = res[f"base_{k}"]
@@ -658,7 +727,8 @@ def revisar(res: dict) -> dict:
             alertas.append(f"[{nombre}] TC implícito salta {r['VAR_MES']:.1%} en {int(r['AÑO_MES_MOV'])}")
 
         # --- diagonales recientes ---
-        mm = movimiento_mensual(base)
+        base_mov = base[base["ATIPICOS"] == "N"] if EXCLUIR_ATIPICOS_TRIANGULO else base
+        mm = movimiento_mensual(base_mov)
         rev[f"movimiento_mensual_{k}"] = mm
         if mm.shape[1] >= 3:
             for ramo, fila in mm.iterrows():
@@ -741,7 +811,7 @@ def _config_log() -> None:
 def correr() -> dict:
     """Procesa todos los archivos. No exporta."""
     m = cargar_maestros()
-    bases_nv, bases_v, errores, cuadres = [], [], [], []
+    bases_nv, bases_v, errores, cuadres, atipicos = [], [], [], [], []
 
     for nombre in sorted(os.listdir(RUTA)):
         tipo = clasificar_archivo(nombre)
@@ -753,7 +823,9 @@ def correr() -> dict:
         partes = dividir_autos(df) if tipo == "autos" else {nombre: df}
 
         for etiqueta, parte in partes.items():
-            base, err, cuadre = procesar(parte, m, f"{nombre} | {etiqueta}", vida=(tipo == "vida"))
+            base, err, cuadre, det_atip = procesar(parte, m, f"{nombre} | {etiqueta}", vida=(tipo == "vida"))
+            if not det_atip.empty:
+                atipicos.append(det_atip)
             (bases_v if tipo == "vida" else bases_nv).append(base)
             if not err.empty:
                 errores.append(err.assign(ES_VIDA=(tipo == "vida")))
@@ -766,17 +838,20 @@ def correr() -> dict:
         "base_v": base_v,
         "errores": pd.concat(errores, ignore_index=True) if errores else pd.DataFrame(),
         "cuadres": pd.DataFrame(cuadres),
+        "atipicos_percentil": pd.concat(atipicos, ignore_index=True) if atipicos else pd.DataFrame(),
         "tri_nv": construir_triangulos(base_nv) if not base_nv.empty else {},
         "tri_v": construir_triangulos(base_v) if not base_v.empty else {},
     }
 
 
 def exportar(res: dict, bases: bool = True, errores: bool = True, cuadres: bool = True,
-             triangulos: bool = True) -> pd.DataFrame | None:
+             atipicos: bool = True, triangulos: bool = True) -> pd.DataFrame | None:
     """Exporta lo ya revisado. Los triángulos van a la hoja 'triangulo' del Excel de cada ramo."""
     RUTA_OUTPUT.mkdir(parents=True, exist_ok=True)
     if cuadres:
         exportar_tabla(res["cuadres"], f"cuadres_{SUFIJO}")
+    if atipicos and not res["atipicos_percentil"].empty:
+        exportar_tabla(res["atipicos_percentil"], f"atipicos_percentil_{SUFIJO}")
     for es_vida, suf in [(False, ""), (True, "_vida")]:
         base = res["base_v" if es_vida else "base_nv"]
         if bases and not base.empty:
