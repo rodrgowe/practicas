@@ -32,19 +32,18 @@ from __future__ import annotations
 import logging
 import os
 import re
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from openpyxl import load_workbook
 
 # =============================================================================
 # 0. CONFIGURACIÓN
 # =============================================================================
 RUTA = Path(r"C:\Users\crolaz1\OneDrive - MAPFRE\crolaz1_0\Lyz\6. Proyecto IBNR\2026\7_Agosto IBNR\00_DATA_CIERRE_DETALLADA\DATOS_BRUTOS")
 RUTA_OUTPUT = Path(r"C:\Users\crolaz1\OneDrive - MAPFRE\crolaz1_0\Lyz\6. Proyecto IBNR\2026\suficiencia\base")
+RUTA_TRIANGULOS = RUTA_OUTPUT.parent / "triangulos"  # REVISAR: carpeta de los Excel de triángulos
 RUTA_MAESTROS = Path(r"C:\Users\crolaz1\OneDrive - MAPFRE\crolaz1_0\Lyz\6. Proyecto IBNR\2026\suficiencia\maestros")
 RUTA_CANAL = Path(r"C:/Users/crolaz1/Downloads")
 
@@ -96,8 +95,7 @@ DESDE_OCURRENCIA = 201901       # el triángulo empieza en este año-mes (celda 
 MES_CORTE = 202608              # REVISAR: último mes de cierre (para los controles)
 
 # Triángulos en Excel
-HOJA_TRIANGULO = "triangulo"    # A2 = primer índice, B2 = primer valor (dev 0)
-MAPA_EXCEL_RAMO: dict[str, str] = {}  # {"NUEVO RAMO": "archivo.xlsx"} si el nombre no coincide
+# (un Excel para no vida y otro para vida, una hoja por ramo; índices desde A2, valores desde B2)
 TRIANGULO_ACUMULADO = False     # False = incremental (como el original)  # REVISAR
 TRIANGULO_FUTURO_VACIO = False  # True = deja en blanco las celdas no observadas
 
@@ -489,72 +487,36 @@ def exportar_tabla(df: pd.DataFrame, nombre: str) -> None:
     log.info("Exportado %s (%s filas)", ruta.name, len(df))
 
 
-def _norm(txt: str) -> str:
-    txt = unicodedata.normalize("NFKD", str(txt)).encode("ascii", "ignore").decode()
-    return re.sub(r"[^a-z0-9]", "", txt.lower())
+def exportar_triangulos_excel(triangulos: dict[str, pd.DataFrame], nombre: str) -> Path | None:
+    """Un Excel con una hoja por ramo (hoja = nombre del NUEVO RAMO).
+    Fila 1 = encabezados (A1 = AÑO_MES_OCU, B1.. = desarrollo); índices desde A2, valores desde B2."""
+    if not triangulos:
+        return None
+    RUTA_TRIANGULOS.mkdir(parents=True, exist_ok=True)
+    ruta = RUTA_TRIANGULOS / f"{nombre}.xlsx"
+    usados: set[str] = set()
+    with pd.ExcelWriter(ruta, engine="openpyxl") as xw:
+        for ramo, t in triangulos.items():
+            out = t.cumsum(axis=1) if TRIANGULO_ACUMULADO else t.copy()
+            if TRIANGULO_FUTURO_VACIO:
+                n = len(out)
+                futuro = np.add.outer(np.arange(n), out.columns.to_numpy(dtype=int)) > n - 1
+                out = out.mask(futuro)
+            out.index.name = "AÑO_MES_OCU"
+            out.columns.name = None
 
-
-def buscar_excel_ramo(ramo: str) -> Path | None:
-    """Excel del ramo en RUTA_OUTPUT: por mapa manual, nombre exacto o nombre que lo contiene."""
-    if ramo in MAPA_EXCEL_RAMO:
-        return RUTA_OUTPUT / MAPA_EXCEL_RAMO[ramo]
-    propios = ("base", "errores", "cuadres", "polizas", "incurrido_canal", "triangulos")
-    archivos = [
-        p for p in RUTA_OUTPUT.glob("*.xlsx")
-        if not p.name.startswith("~$") and not p.stem.lower().startswith(propios)
-    ]
-    exactos = [p for p in archivos if _norm(p.stem) == _norm(ramo)]
-    if exactos:
-        return exactos[0]
-    contiene = [p for p in archivos if _norm(ramo) in _norm(p.stem)]
-    if len(contiene) == 1:
-        return contiene[0]
-    if len(contiene) > 1:
-        log.warning("Ramo %s: varios Excel posibles %s; usa MAPA_EXCEL_RAMO", ramo, [p.name for p in contiene])
-    return None
-
-
-def escribir_triangulo_excel(t: pd.DataFrame, ruta: Path) -> None:
-    """Escribe el triángulo en la hoja HOJA_TRIANGULO: índices desde A2, valores desde B2.
-    No toca la fila 1 ni el resto del libro (fórmulas incluidas)."""
-    n = len(t)
-    if int(t.columns.min()) != 0:
-        log.warning("%s: la columna B no es desarrollo 0 (primer dev = %s)", ruta.name, t.columns.min())
-    out = t.cumsum(axis=1) if TRIANGULO_ACUMULADO else t
-
-    wb = load_workbook(ruta)
-    hoja = next((h for h in wb.sheetnames if h.lower() == HOJA_TRIANGULO.lower()), None)
-    ws = wb[hoja] if hoja else wb.create_sheet(HOJA_TRIANGULO)
-
-    previas = sum(1 for r in range(2, ws.max_row + 1) if isinstance(ws.cell(r, 1).value, (int, float)))
-    if previas > n:
-        log.warning("%s: la hoja tenía %s filas de índice y ahora hay %s; revisa filas sobrantes", ruta.name, previas, n)
-
-    for i, (mes, fila) in enumerate(out.iterrows()):
-        r = 2 + i
-        ws.cell(row=r, column=1, value=int(mes))
-        for j, (dev, v) in enumerate(fila.items()):
-            futuro = TRIANGULO_FUTURO_VACIO and (i + int(dev) > n - 1)
-            ws.cell(row=r, column=2 + j, value=None if futuro else float(v))
-    wb.save(ruta)
-
-
-def escribir_triangulos_excel(triangulos: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    estado = []
-    for ramo, t in triangulos.items():
-        ruta = buscar_excel_ramo(ramo)
-        if ruta is None or not ruta.exists():
-            log.warning("Ramo %s: no se encontró su Excel en %s", ramo, RUTA_OUTPUT)
-            estado.append({"RAMO": ramo, "ARCHIVO": None, "ESTADO": "EXCEL NO ENCONTRADO"})
-            continue
-        try:
-            escribir_triangulo_excel(t, ruta)
-            estado.append({"RAMO": ramo, "ARCHIVO": ruta.name, "ESTADO": "OK"})
-            log.info("Triángulo %s -> %s", ramo, ruta.name)
-        except PermissionError:
-            log.warning("%s está abierto; ciérralo y vuelve a exportar", ruta.name)
-            estado.append({"RAMO": ramo, "ARCHIVO": ruta.name, "ESTADO": "ARCHIVO ABIERTO"})
-    return pd.DataFrame(estado)
+            limpio = re.sub(r"[\[\]:*?/\\]", "_", str(ramo))
+            hoja = limpio[:31]
+            if len(limpio) > 31:
+                log.warning("Nombre de hoja truncado a 31 caracteres: %s", ramo)
+            k = 1
+            while hoja.lower() in usados:
+                k += 1
+                hoja = f"{limpio[:28]}_{k}"
+            usados.add(hoja.lower())
+            out.to_excel(xw, sheet_name=hoja)
+    log.info("Exportado %s (%s hojas)", ruta, len(triangulos))
+    return ruta
 
 
 # =============================================================================
@@ -849,8 +811,11 @@ def correr() -> dict:
 
 
 def exportar(res: dict, bases: bool = True, errores: bool = True, cuadres: bool = True,
-             atipicos: bool = True, triangulos: bool = True) -> pd.DataFrame | None:
-    """Exporta lo ya revisado. Los triángulos van a la hoja 'triangulo' del Excel de cada ramo."""
+             atipicos: bool = True, triangulos: bool = True) -> None:
+    """Exporta lo ya revisado.
+    Bases, errores, cuadres y atípicos -> RUTA_OUTPUT.
+    Triángulos -> RUTA_TRIANGULOS: triangulos_no_vida_<SUFIJO>.xlsx y triangulos_vida_<SUFIJO>.xlsx,
+    con una hoja por ramo."""
     RUTA_OUTPUT.mkdir(parents=True, exist_ok=True)
     if cuadres:
         exportar_tabla(res["cuadres"], f"cuadres_{SUFIJO}")
@@ -866,13 +831,10 @@ def exportar(res: dict, bases: bool = True, errores: bool = True, cuadres: bool 
             if not e.empty:
                 exportar_tabla(e, f"errores{suf}_final_{SUFIJO}")
     if triangulos:
-        estado = pd.concat(
-            [escribir_triangulos_excel(res["tri_nv"]), escribir_triangulos_excel(res["tri_v"])],
-            ignore_index=True,
-        )
-        print(estado.to_string(index=False))
-        return estado
-    return None
+        for clave, nombre in [("tri_nv", f"triangulos_no_vida_{SUFIJO}"), ("tri_v", f"triangulos_vida_{SUFIJO}")]:
+            ruta = exportar_triangulos_excel(res[clave], nombre)
+            if ruta:
+                print(f"Triángulos: {ruta} ({len(res[clave])} hojas)")
 
 
 def extras() -> None:
