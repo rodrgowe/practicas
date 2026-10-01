@@ -143,7 +143,8 @@ UMBRALES = {
     "factor_max": 3.0,
     "pct_celdas_neg": 0.05,      # % de celdas observadas negativas
     "salto_retencion": 0.20,     # variación anual de retención implícita
-    "pct_atipico": 0.30,         # % del incurrido bruto que es atípico
+    "pct_atipico": 0.30,         # % del incurrido bruto que es atípico (ramo-año)
+    "pct_atipico_total": 0.15,   # % del incurrido bruto que es atípico (ramo, todo el periodo)
     "pct_error_dif": 0.01,       # dif<0 sobre incurrido total
     "mult_mov_ultimo_mes": 3.0,  # último mes vs mediana de los 12 previos
     "tol_puente": 1e-6,          # tolerancia relativa del puente inicial -> final
@@ -548,9 +549,13 @@ def leer_archivo(ruta: Path) -> pd.DataFrame:
     return df
 
 
-def dividir_autos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """AUTOS 1/2 reciben los expedientes transferibles de AUTOS 3 de sus
-    siniestros; AUTOS 3 se queda sin ellos."""
+def dividir_autos(df: pd.DataFrame, etiqueta: str = "") -> tuple[dict[str, pd.DataFrame], dict]:
+    """AUTOS 1/2 reciben los expedientes transferibles (TIP_EXP_TRANSFERIBLES) de
+    AUTOS 3 de sus siniestros; AUTOS 3 se queda sin ellos.
+
+    Cada fila de AUTOS 3 se asigna a UN solo subgrupo: si el siniestro está en
+    AUTOS 1 y en AUTOS 2, va a AUTOS 1 (prioridad fija) y no se copia a AUTOS 2.
+    Devuelve (partes, stats). stats trae los controles de reclasificación."""
     otros = set(df["SUBGRUPO"].dropna().unique()) - set(SUBGRUPOS_AUTOS)
     if otros:
         log.warning("Autos: subgrupos no procesados: %s", otros)
@@ -558,22 +563,52 @@ def dividir_autos(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     a3 = df[df["SUBGRUPO"] == "AUTOS 3"]
     a3_transf = a3[a3["TIP_EXP"].isin(TIP_EXP_TRANSFERIBLES)]
 
-    partes: dict[str, pd.DataFrame] = {}
-    transferidos: set = set()
-    for y in ["AUTOS 1", "AUTOS 2"]:
-        base_y = df[df["SUBGRUPO"] == y]
-        con = a3_transf[a3_transf["NUM_SINI"].isin(base_y["NUM_SINI"].unique())].copy()
-        con["SUBGRUPO"] = y  # REVISAR: se reclasifican como AUTOS 1/2
-        repetidos = transferidos & set(con["NUM_SINI"].unique())
-        if repetidos:
-            log.warning("Autos: %s siniestros transferidos a más de un subgrupo", len(repetidos))
-        transferidos |= set(con["NUM_SINI"].unique())
-        log.info("%s: %s filas transferidas desde AUTOS 3", y, len(con))
-        partes[y] = pd.concat([base_y, con], ignore_index=True)
+    base1 = df[df["SUBGRUPO"] == "AUTOS 1"]
+    base2 = df[df["SUBGRUPO"] == "AUTOS 2"]
+    sini1 = set(base1["NUM_SINI"].dropna().unique())
+    sini2 = set(base2["NUM_SINI"].dropna().unique())
 
-    mask_quitar = a3["NUM_SINI"].isin(transferidos) & a3["TIP_EXP"].isin(TIP_EXP_TRANSFERIBLES)
-    partes["AUTOS 3"] = a3[~mask_quitar]
-    return partes
+    # Prioridad: AUTOS 1; el resto (solo en AUTOS 2) va a AUTOS 2.
+    mask1 = a3_transf["NUM_SINI"].isin(sini1)
+    mask2 = a3_transf["NUM_SINI"].isin(sini2) & ~mask1
+    con1 = a3_transf[mask1].copy()
+    con2 = a3_transf[mask2].copy()
+    con1["SUBGRUPO"] = "AUTOS 1"
+    con2["SUBGRUPO"] = "AUTOS 2"
+
+    partes = {
+        "AUTOS 1": pd.concat([base1, con1], ignore_index=True),
+        "AUTOS 2": pd.concat([base2, con2], ignore_index=True),
+    }
+    quitadas = a3_transf.index[mask1 | mask2]
+    partes["AUTOS 3"] = a3.drop(index=quitadas)
+
+    # Controles: lo que habría pasado con la lógica anterior (copiar a ambos)
+    en_ambos = a3_transf[mask1 & a3_transf["NUM_SINI"].isin(sini2)]
+    sol_ambos = _sol_origen(en_ambos) if len(en_ambos) else 0.0
+    n_partes = sum(len(p) for p in partes.values())
+    stats = {
+        "ARCHIVO": etiqueta,
+        "FILAS_ORIGEN": len(df),
+        "FILAS_TRAS_DIVIDIR": n_partes,
+        "SOL_ORIGEN": _sol_origen(df),
+        "SOL_TRAS_DIVIDIR": sum(_sol_origen(p) for p in partes.values()),
+        "FILAS_A_AUTOS1": len(con1),
+        "FILAS_A_AUTOS2": len(con2),
+        "SINI_EN_AUTOS1_Y_2": len(sini1 & sini2 & set(a3_transf["NUM_SINI"].unique())),
+        "FILAS_A3_EN_AMBOS": len(en_ambos),
+        "SOL_A3_EN_AMBOS": sol_ambos,
+        "SUBGRUPOS_NO_PROCESADOS": ", ".join(sorted(map(str, otros))),
+        "FILAS_SUBGRUPOS_NO_PROCESADOS": int(df["SUBGRUPO"].isin(otros).sum()) if otros else 0,
+    }
+    if stats["SINI_EN_AUTOS1_Y_2"]:
+        log.warning(
+            "Autos: %s siniestros están en AUTOS 1 y AUTOS 2; sus filas de AUTOS 3 (%s filas, %s soles) "
+            "se asignaron solo a AUTOS 1",
+            stats["SINI_EN_AUTOS1_Y_2"], len(en_ambos), f"{sol_ambos:,.0f}",
+        )
+    log.info("AUTOS 1: %s filas transferidas desde AUTOS 3 | AUTOS 2: %s", len(con1), len(con2))
+    return partes, stats
 
 
 # =============================================================================
@@ -1153,6 +1188,46 @@ def resumen_anual(base: pd.DataFrame) -> pd.DataFrame:
     return g.drop(columns=["INCURRIDO_DOL", "INCURRIDO_DOL_NETO", "DOL_ATIPICO"])
 
 
+def peso_atipicos(base: pd.DataFrame) -> pd.DataFrame:
+    """Peso de los atípicos sobre el total, por NUEVO RAMO + TOTAL (misma ventana que los triángulos).
+    Siniestros: cantidad y % . Montos: bruto y neto en miles de USD y % (con signo), y el bruto
+    atípico separado por tipo (operativa / percentil_sup / percentil_inf)."""
+    b = base
+    if DESDE_OCURRENCIA is not None:
+        b = b[b["AÑO_MES_OCU"] >= DESDE_OCURRENCIA]
+    b = b.assign(**{"NUEVO RAMO": b["NUEVO RAMO"].fillna("(SIN RAMO)")})
+    es_at = b["ATIPICOS"] == "S"
+
+    def agrupar(d: pd.DataFrame, a: pd.Series) -> pd.DataFrame:
+        r = pd.DataFrame({
+            "N_SINIESTROS": d.groupby("NUEVO RAMO")["NUM_SINI"].nunique(),
+            "N_SINIESTROS_ATIP": d[a].groupby("NUEVO RAMO")["NUM_SINI"].nunique(),
+            "BRUTO_TOTAL_MILES": d.groupby("NUEVO RAMO")["INCURRIDO_DOL"].sum() / 1000,
+            "BRUTO_ATIP_MILES": d[a].groupby("NUEVO RAMO")["INCURRIDO_DOL"].sum() / 1000,
+            "NETO_TOTAL_MILES": d.groupby("NUEVO RAMO")["INCURRIDO_DOL_NETO"].sum() / 1000,
+            "NETO_ATIP_MILES": d[a].groupby("NUEVO RAMO")["INCURRIDO_DOL_NETO"].sum() / 1000,
+        })
+        for t in ("operativa", "percentil_sup", "percentil_inf"):
+            r[f"BRUTO_ATIP_{t.upper()}_MILES"] = (
+                d[a & (d["TIPO_ATIPICO"] == t)].groupby("NUEVO RAMO")["INCURRIDO_DOL"].sum() / 1000
+            )
+        return r.fillna(0.0)
+
+    r = agrupar(b, es_at)
+    r.loc["TOTAL"] = r.sum()
+    # los siniestros no se suman entre ramos si un NUM_SINI se repite; el TOTAL usa únicos reales
+    r.loc["TOTAL", "N_SINIESTROS"] = b["NUM_SINI"].nunique()
+    r.loc["TOTAL", "N_SINIESTROS_ATIP"] = b.loc[es_at, "NUM_SINI"].nunique()
+    r = r.reset_index().rename(columns={"index": "NUEVO RAMO"})
+    r["PCT_SINIESTROS_ATIP"] = r["N_SINIESTROS_ATIP"] / r["N_SINIESTROS"].where(r["N_SINIESTROS"] != 0)
+    r["PCT_BRUTO_ATIP"] = r["BRUTO_ATIP_MILES"] / r["BRUTO_TOTAL_MILES"].where(r["BRUTO_TOTAL_MILES"] != 0)
+    r["PCT_NETO_ATIP"] = r["NETO_ATIP_MILES"] / r["NETO_TOTAL_MILES"].where(r["NETO_TOTAL_MILES"] != 0)
+    orden = ["NUEVO RAMO", "N_SINIESTROS", "N_SINIESTROS_ATIP", "PCT_SINIESTROS_ATIP",
+             "BRUTO_TOTAL_MILES", "BRUTO_ATIP_MILES", "PCT_BRUTO_ATIP",
+             "NETO_TOTAL_MILES", "NETO_ATIP_MILES", "PCT_NETO_ATIP"]
+    return r[orden + [c for c in r.columns if c not in orden]]
+
+
 def ratio_retencion(base: pd.DataFrame, por_anio: bool = False) -> pd.DataFrame:
     """Ratio de retención (neto / bruto, en USD) por NUEVO RAMO, con y sin atípicos.
     Usa la misma ventana que los triángulos (AÑO_MES_OCU >= DESDE_OCURRENCIA).
@@ -1286,6 +1361,22 @@ def _alertas_cuadres(c: pd.DataFrame, alertas: list[str]) -> None:
             alertas.append(f"[RETENCION] {a}: {r['RET_SIN_FECHA']} filas sin {RET_FECHA_BASE} (retención = 1)")
 
 
+def _alertas_autos(a, alertas: list[str]) -> None:
+    """Controles de la reclasificación AUTOS 3 -> AUTOS 1/2."""
+    if a is None or a.empty:
+        return
+    for _, r in a.iterrows():
+        n = r["ARCHIVO"]
+        if r["FILAS_TRAS_DIVIDIR"] != r["FILAS_ORIGEN"]:
+            alertas.append(f"[AUTOS] {n}: tras dividir quedan {r['FILAS_TRAS_DIVIDIR']} filas de {r['FILAS_ORIGEN']} (se pierden o duplican filas)")
+        if abs(r["SOL_TRAS_DIVIDIR"] - r["SOL_ORIGEN"]) > 1.0:
+            alertas.append(f"[AUTOS] {n}: la división cambia el incurrido ({r['SOL_ORIGEN']:,.0f} -> {r['SOL_TRAS_DIVIDIR']:,.0f} soles)")
+        if r["FILAS_SUBGRUPOS_NO_PROCESADOS"]:
+            alertas.append(f"[AUTOS] {n}: {r['FILAS_SUBGRUPOS_NO_PROCESADOS']} filas con SUBGRUPO no reconocido ({r['SUBGRUPOS_NO_PROCESADOS']}) quedan fuera")
+        if r["SINI_EN_AUTOS1_Y_2"]:
+            alertas.append(f"[AUTOS] {n}: {r['SINI_EN_AUTOS1_Y_2']} siniestros están en AUTOS 1 y 2; sus {r['FILAS_A3_EN_AMBOS']} filas de AUTOS 3 ({r['SOL_A3_EN_AMBOS']:,.0f} soles) se asignaron solo a AUTOS 1")
+
+
 def _alertas_retencion_maestros(stats: dict, alertas: list[str]) -> None:
     for nombre, st in stats.items():
         if st.get("negativas"):
@@ -1321,6 +1412,9 @@ def revisar(res: dict) -> dict:
             "FECHAS_MDY_INEQUIVOCAS", "FECHAS_AMBIGUAS", "FEC_SINI_MIN", "FEC_SINI_MAX", "FEC_MVTO_MIN", "FEC_MVTO_MAX",
         ]]
     _alertas_retencion_maestros(res.get("ret_stats", {}), alertas)
+    _alertas_autos(res.get("autos_stats"), alertas)
+    if res.get("autos_stats") is not None and not res["autos_stats"].empty:
+        rev["reclasificacion_autos"] = res["autos_stats"]
 
     if not res["atipicos_percentil"].empty:
         rev["atipicos_percentil"] = res["atipicos_percentil"]
@@ -1363,6 +1457,13 @@ def revisar(res: dict) -> dict:
             salto = g["RET_IMPLICITA"].diff().abs()
             for _, r in g[salto > u["salto_retencion"]].iterrows():
                 alertas.append(f"[{nombre}] {ramo} {r['AÑO_SINI']}: retención implícita cambia >{u['salto_retencion']:.0%} vs año previo")
+
+        # --- peso de los atípicos sobre el total, por ramo ---
+        pa = peso_atipicos(base)
+        rev[f"peso_atipicos_{k}"] = pa
+        for _, r in pa[pa["NUEVO RAMO"] != "TOTAL"].iterrows():
+            if pd.notna(r["PCT_BRUTO_ATIP"]) and abs(r["PCT_BRUTO_ATIP"]) > u["pct_atipico_total"]:
+                alertas.append(f"[{nombre}] {r['NUEVO RAMO']}: atípicos = {r['PCT_BRUTO_ATIP']:.1%} del incurrido bruto total ({int(r['N_SINIESTROS_ATIP'])} de {int(r['N_SINIESTROS'])} siniestros)")
 
         # --- ratio de retención por ramo, con y sin atípicos ---
         rev[f"ratio_retencion_{k}"] = ratio_retencion(base)
@@ -1454,6 +1555,12 @@ def revisar(res: dict) -> dict:
         if d is not None:
             print(f"\n--- Ratio de retención (neto/bruto, USD) {segmentos[k]} ---")
             print(d[["NUEVO RAMO", "RATIO_RET_CON_ATIP", "RATIO_RET_SIN_ATIP", "DIF_PUNTOS"]].round(4).to_string(index=False))
+    for k in ("nv", "v"):
+        d = rev.get(f"peso_atipicos_{k}")
+        if d is not None:
+            print(f"\n--- Peso de atípicos sobre el total {segmentos[k]} (miles USD) ---")
+            print(d[["NUEVO RAMO", "N_SINIESTROS", "N_SINIESTROS_ATIP", "PCT_SINIESTROS_ATIP",
+                     "BRUTO_ATIP_MILES", "PCT_BRUTO_ATIP", "NETO_ATIP_MILES", "PCT_NETO_ATIP"]].round(3).to_string(index=False))
     print("\nTablas en rev:", ", ".join(rev.keys()))
     return rev
 
@@ -1473,10 +1580,19 @@ def _config_log() -> None:
     log.propagate = False
 
 
+def cerrar_log() -> None:
+    """Cierra y libera el archivo log_*.txt (útil si Excel/Windows lo deja bloqueado
+    o si vas a borrarlo/moverlo). La próxima corrida lo vuelve a abrir sola."""
+    for h in list(log.handlers):
+        h.flush()
+        h.close()
+        log.removeHandler(h)
+
+
 def correr() -> dict:
     """Procesa todos los archivos. No exporta."""
     m = cargar_maestros()
-    bases_nv, bases_v, errores, cuadres, atipicos = [], [], [], [], []
+    bases_nv, bases_v, errores, cuadres, atipicos, autos_stats = [], [], [], [], [], []
 
     for nombre in sorted(os.listdir(RUTA)):
         tipo = clasificar_archivo(nombre)
@@ -1485,7 +1601,11 @@ def correr() -> dict:
             continue
 
         df = leer_archivo(RUTA / nombre)
-        partes = dividir_autos(df) if tipo == "autos" else {nombre: df}
+        if tipo == "autos":
+            partes, st_autos = dividir_autos(df, nombre)
+            autos_stats.append(st_autos)
+        else:
+            partes = {nombre: df}
 
         for etiqueta, parte in partes.items():
             base, err, cuadre, det_atip = procesar(parte, m, f"{nombre} | {etiqueta}", vida=(tipo == "vida"))
@@ -1509,6 +1629,7 @@ def correr() -> dict:
         "cuadres": pd.DataFrame(cuadres),
         "atipicos_percentil": pd.concat(atipicos, ignore_index=True) if atipicos else pd.DataFrame(),
         "ret_stats": m.ret.stats,
+        "autos_stats": pd.DataFrame(autos_stats),
         "tri_nv_bruto": triangulos(base_nv, COL_TRIANGULO_BRUTO),
         "tri_nv_neto": triangulos(base_nv, COL_TRIANGULO_NETO),
         "tri_v_bruto": triangulos(base_v, COL_TRIANGULO_BRUTO),
@@ -1526,6 +1647,8 @@ def exportar(res: dict, bases: bool = True, errores: bool = True, cuadres: bool 
     RUTA_OUTPUT.mkdir(parents=True, exist_ok=True)
     if cuadres:
         exportar_tabla(res["cuadres"], f"cuadres_{SUFIJO}")
+        if not res.get("autos_stats", pd.DataFrame()).empty:
+            exportar_tabla(res["autos_stats"], f"reclasificacion_autos_{SUFIJO}")
     if atipicos and not res["atipicos_percentil"].empty:
         exportar_tabla(res["atipicos_percentil"], f"atipicos_percentil_{SUFIJO}")
     for es_vida, suf in [(False, ""), (True, "_vida")]:
